@@ -103,13 +103,23 @@ a{color:var(--blue)}
 </head>
 <body>
 <header>
-  <b>본움 훈련 관리</b><span class="proto">시제품 · 가상 데이터</span>
+  <b>본움 훈련 관리</b><span class="proto" id="modeTag">시제품 · 가상 데이터</span>
   <span class="sp"></span>
+  <span id="syncTag" style="font-size:12px;opacity:.85"></span>
   <button id="resetBtn" onclick="resetData()">예시 데이터로 초기화</button>
+  <button id="logoutBtn" style="display:none" onclick="logout()">로그아웃</button>
 </header>
 <nav id="nav"></nav>
 <main id="app"></main>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js"></script>
+<script>
+/* ================= 서버 연결 설정 =================
+   비워 두면 '시제품 모드'(이 기기 브라우저에만 저장)로 동작합니다.
+   SUPA_KEY는 웹페이지용 공개 키(anon/publishable)만 넣습니다. service_role/secret 키는 절대 넣지 않습니다. */
+const SUPA_URL='https://sxctcikymmmcckayvmhg.supabase.co';
+const SUPA_KEY='sb_publishable_KDN31DJNmQUZRSeo8AzugQ_iaSAUeql'; // 공개용 키(웹에 넣어도 되는 키). 실제 보호는 서버의 권한 규칙(RLS)
+</script>
 <script>
 /* ================= 기본 도구 ================= */
 const KEY='bonum-proto-v3';
@@ -189,8 +199,100 @@ function seed(){
 }
 let S;
 function load(){try{S=JSON.parse(localStorage.getItem(KEY))}catch(e){S=null}if(!S||!S.prog)S=seed();S.msgs=S.msgs||[];S.lib.forEach(e=>{if(!e.video&&SAMPLE_VIDEOS[e.name])e.video=SAMPLE_VIDEOS[e.name]});save()}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
-function resetData(){if(confirm('예시 데이터로 되돌릴까요? 입력한 내용은 지워집니다.')){S=null;seed();save();render()}}
+function save(){if(CLOUD){queueSync();return}try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
+function resetData(){
+  if(CLOUD){if(ROLE!=='coach')return;
+    if(S.ath.length||S.wo.length){alert('서버에 이미 데이터가 있어 예시 데이터를 올리지 않습니다.');return}
+    if(!confirm('서버에 예시 데이터(가상 선수 6명, 훈련 3개, 12주 프로그램)를 올릴까요?'))return;S=null;seed();save();render();return}
+  if(confirm('예시 데이터로 되돌릴까요? 입력한 내용은 지워집니다.')){S=null;seed();save();render()}}
+
+/* ================= 서버 동기화 (Supabase) =================
+   방식: 화면 코드는 그대로 S를 바꾸고 save()를 부르면, 마지막으로 서버와 맞춘 상태와 비교해
+   바뀐 줄만 올리고(upsert) 지워진 줄은 지웁니다. 30초마다·화면으로 돌아올 때 서버 내용을 다시 받아옵니다. */
+const CLOUD=!!(SUPA_URL&&SUPA_KEY&&window.supabase);
+let sb=null, ROLE=null, ME=null, SNAP={}, syncTimer=null, syncing=false, pendingSync=false, authMsg='';
+const COLL={
+  ath:{table:'athletes',key:'id',toRow:a=>({id:a.id,name:a.name,grp:a.group,email:a.email||null}),fromRow:r=>({id:r.id,name:r.name,group:r.grp,email:r.email||''})},
+  lib:{table:'library',key:'id',toRow:x=>({id:x.id,data:x}),fromRow:r=>r.data},
+  wo:{table:'workouts',key:'id',toRow:x=>({id:x.id,data:x}),fromRow:r=>r.data},
+  prog:{table:'programs',key:'id',toRow:x=>({id:x.id,data:x}),fromRow:r=>r.data},
+  asg:{table:'assignments',key:'id',toRow:a=>({id:a.id,ath:a.ath,date:a.date,data:a}),fromRow:r=>r.data},
+  msgs:{table:'messages',key:'id',toRow:m=>({id:m.id,sender:m.from,recipient:m.to,body:m.text,at:new Date(m.at.replace(' ','T')).toISOString()}),
+    fromRow:r=>{const d=new Date(r.at);return {id:r.id,from:r.sender,to:r.recipient,text:r.body,at:ds(d)+' '+pad(d.getHours())+':'+pad(d.getMinutes())}}}
+};
+function listOf(c){return c==='logs'?Object.entries(S.logs).map(([id,l])=>({id,l})):S[c]}
+function rowOf(c,x){if(c==='logs'){const a=S.asg.find(y=>y.id===x.id);return a?{asg_id:x.id,ath:a.ath,data:x.l}:null}return COLL[c].toRow(x)}
+function setTag(t){const el=document.getElementById('syncTag');if(el)el.textContent=t}
+function snapshot(){SNAP={};['ath','lib','wo','prog','asg','msgs','logs'].forEach(c=>{SNAP[c]={};listOf(c).forEach(x=>SNAP[c][x.id]=JSON.stringify(x))})}
+async function fetchAll(table){let out=[],from=0;for(;;){const {data,error}=await sb.from(table).select('*').range(from,from+999);if(error)throw error;out=out.concat(data);if(data.length<1000)break;from+=1000}return out}
+async function pull(){
+  const S2={lib:[],wo:[],prog:[],ath:[],asg:[],logs:{},msgs:[]};
+  const tasks=[['ath','athletes'],['lib','library'],['wo','workouts'],['asg','assignments'],['msgs','messages']];
+  if(ROLE==='coach')tasks.push(['prog','programs']);
+  for(const [c,t] of tasks)S2[c]=(await fetchAll(t)).map(COLL[c].fromRow);
+  (await fetchAll('logs')).forEach(r=>S2.logs[r.asg_id]=r.data);
+  S=S2;snapshot();
+}
+function queueSync(){pendingSync=true;setTag('저장 중…');clearTimeout(syncTimer);syncTimer=setTimeout(pushSync,600)}
+async function pushSync(){
+  if(syncing){syncTimer=setTimeout(pushSync,400);return}
+  syncing=true;pendingSync=false;
+  try{
+    const order=['ath','lib','wo','prog','asg','logs','msgs']; // 참조 순서(선수 → 배정 → 기록)
+    for(const c of order){if(ROLE!=='coach'&&!['logs','msgs'].includes(c))continue;
+      const table=c==='logs'?'logs':COLL[c].table,key=c==='logs'?'asg_id':'id';
+      const cur={};listOf(c).forEach(x=>cur[x.id]=x);
+      const changed=Object.values(cur).filter(x=>SNAP[c][x.id]!==JSON.stringify(x)).map(x=>rowOf(c,x)).filter(Boolean);
+      if(changed.length){const {error}=await sb.from(table).upsert(changed);if(error)throw error}
+      changed.forEach(r=>{const id=r[key];const x=cur[id];SNAP[c][id]=JSON.stringify(x)});
+    }
+    for(const c of [...order].reverse()){if(ROLE!=='coach')break; // 지우기는 트레이너만, 기록 → 배정 → 선수 순
+      const table=c==='logs'?'logs':COLL[c].table,key=c==='logs'?'asg_id':'id';
+      const cur=new Set(listOf(c).map(x=>x.id));const gone=Object.keys(SNAP[c]).filter(id=>!cur.has(id));
+      if(gone.length){const {error}=await sb.from(table).delete().in(key,gone);if(error)throw error;gone.forEach(id=>delete SNAP[c][id])}
+    }
+    setTag('저장됨 '+new Date().toTimeString().slice(0,5));
+  }catch(e){console.error(e);setTag('저장 실패 — 다시 시도 중');pendingSync=true;setTimeout(pushSync,5000)}
+  finally{syncing=false}
+}
+async function refresh(force){
+  if(!CLOUD||!ROLE||pendingSync||syncing)return;
+  const a=document.activeElement;if(!force&&a&&/INPUT|TEXTAREA|SELECT/.test(a.tagName))return; // 입력 중엔 화면을 바꾸지 않음
+  try{await pull();render();setTag('최신 '+new Date().toTimeString().slice(0,5))}catch(e){console.error(e);setTag('불러오기 실패')}
+}
+async function whoAmI(){
+  const {data:{session}}=await sb.auth.getSession();if(!session){ROLE=null;return}
+  ME=session.user.email;
+  const c=await sb.from('coaches').select('email').limit(1);
+  if(!c.error&&c.data.length){ROLE='coach';return}
+  const a=await sb.from('athletes').select('id').limit(1);
+  if(!a.error&&a.data.length){ROLE='athlete';viewAth=a.data[0].id;return}
+  ROLE='none';
+}
+function loginView(){
+  return `<div class="phone"><div class="card"><h2>로그인</h2>
+  <div class="muted" style="margin-bottom:10px">트레이너나 선수 명단에 등록된 이메일로 로그인합니다. 처음이면 같은 이메일로 '처음 가입'을 누르세요.</div>
+  <input id="liEmail" type="email" placeholder="이메일" style="width:100%;margin-bottom:8px" autocomplete="email">
+  <input id="liPw" type="password" placeholder="비밀번호 (6자 이상)" style="width:100%;margin-bottom:10px" autocomplete="current-password">
+  <button class="btn" style="width:100%" onclick="doLogin(false)">로그인</button>
+  <button class="btn ghost" style="width:100%;margin-top:6px" onclick="doLogin(true)">처음 가입</button>
+  ${authMsg?`<div class="notebox">${esc(authMsg)}</div>`:''}</div></div>`;
+}
+async function doLogin(signup){
+  const email=document.getElementById('liEmail').value.trim(),pw=document.getElementById('liPw').value;
+  if(!email||pw.length<6){authMsg='이메일과 6자 이상 비밀번호를 넣어 주세요.';render();return}
+  const r=signup?await sb.auth.signUp({email,password:pw}):await sb.auth.signInWithPassword({email,password:pw});
+  if(r.error){authMsg=signup?'가입 실패: '+r.error.message:'로그인 실패: 이메일이나 비밀번호를 확인해 주세요.';render();return}
+  if(signup&&!r.data.session){authMsg='가입은 됐지만 바로 로그인되지 않았습니다. 관리자 설정(이메일 확인 끄기)을 확인해 주세요.';render();return}
+  authMsg='';await startCloud();
+}
+async function logout(){await sb.auth.signOut();ROLE=null;S={lib:[],wo:[],prog:[],ath:[],asg:[],logs:{},msgs:[]};render()}
+async function startCloud(){
+  document.getElementById('app').innerHTML='<div class="card empty">불러오는 중…</div>';
+  await whoAmI();
+  if(ROLE==='coach'||ROLE==='athlete'){try{await pull()}catch(e){console.error(e);authMsg='데이터를 불러오지 못했습니다: '+e.message}}
+  render();
+}
 
 /* ================= 조회 도우미 ================= */
 const ex=id=>S.lib.find(x=>x.id===id)||{name:'(삭제된 운동)',tag:'',unit:'reps'};
@@ -232,6 +334,17 @@ const TABS=[['dash','현황판'],['field','현장 기록'],['assign','배정'],[
 let tab='dash', weekOff=0, viewAth=null;
 function go(t){tab=t;render();window.scrollTo(0,0)}
 function render(){
+  if(CLOUD){
+    document.getElementById('modeTag').textContent=ROLE==='coach'?'트레이너 · '+(ME||''):ROLE==='athlete'?'선수':'로그인 필요';
+    document.getElementById('logoutBtn').style.display=ROLE?'':'none';
+    document.getElementById('resetBtn').style.display=(ROLE==='coach'&&!S.ath.length&&!S.wo.length)?'':'none';
+    document.getElementById('resetBtn').textContent='예시 데이터 올리기';
+    if(!ROLE){document.getElementById('nav').innerHTML='';document.getElementById('app').innerHTML=loginView();return}
+    if(ROLE==='none'){document.getElementById('nav').innerHTML='';document.getElementById('app').innerHTML=`<div class="phone"><div class="card"><h2>등록되지 않은 이메일</h2><div class="muted">${esc(ME)} 은(는) 트레이너나 선수 명단에 없습니다. 트레이너에게 이 이메일을 선수 명단에 넣어 달라고 요청하세요.</div><button class="btn" style="margin-top:10px" onclick="startCloud()">다시 확인</button></div></div>`;return}
+    if(ROLE==='athlete'){document.getElementById('nav').innerHTML='';document.getElementById('app').innerHTML=athleteView(true);return}
+    if(!S.ath.length&&!S.wo.length&&tab==='dash'){document.getElementById('nav').innerHTML=TABS.map(([k,n])=>`<button class="${tab===k?'on':''}" onclick="go('${k}')">${n}</button>`).join('');
+      document.getElementById('app').innerHTML=`<div class="card"><h2>서버가 비어 있습니다</h2><div class="muted">처음 시작이면 오른쪽 위 '예시 데이터 올리기'로 시험해 보거나, 운동 라이브러리부터 직접 등록하세요.</div></div>`;return}
+  }
   const hashAth=(location.hash.match(/athlete=([\w]+)/)||[])[1];
   const solo=!!(hashAth&&S.ath.some(a=>a.id===hashAth));
   document.getElementById('resetBtn').style.display=solo?'none':'';
@@ -529,7 +642,7 @@ function bulkLib(){const t=document.getElementById('bulk').value.split('\n').map
 
 /* ================= 메시지 · 팀 공지 ================= */
 function msgsFor(athId){const g=at(athId).group;return S.msgs.filter(m=>m.to===athId||m.from===athId||m.to==='team:'+g).sort((a,b)=>a.at.localeCompare(b.at))}
-function sendMsg(from,to,inputId){const el=document.getElementById(inputId);const t=el.value.trim();if(!t)return;S.msgs.push({id:uid(),from,to,text:t,at:new Date().toISOString().slice(0,16).replace('T',' ')});save();render()}
+function sendMsg(from,to,inputId){const el=document.getElementById(inputId);const t=el.value.trim();if(!t)return;const nw=new Date();S.msgs.push({id:uid(),from,to,text:t,at:ds(nw)+' '+pad(nw.getHours())+':'+pad(nw.getMinutes())});save();render()}
 function msgLine(m){const who=m.from==='coach'?'트레이너':esc(at(m.from).name);const to=m.to.startsWith('team:')?'팀 공지':m.to==='coach'?'':'';
   return `<div class="comment"><b>${who}</b>${to?` <span class="tag">${to}</span>`:''} <span class="muted">${esc(m.at.slice(5))}</span><br>${esc(m.text)}</div>`}
 
@@ -619,7 +732,15 @@ function finish(id){const l=ensure(id);const a=S.asg.find(x=>x.id===id);
   l.done=true;l.at=today;save();openAsg=null;render();alert('저장했습니다. 수고했어요!')}
 
 window.addEventListener('hashchange',render);
-load();render();
+if(CLOUD){
+  sb=window.supabase.createClient(SUPA_URL,SUPA_KEY);
+  S={lib:[],wo:[],prog:[],ath:[],asg:[],logs:{},msgs:[]};
+  startCloud();
+  setInterval(()=>refresh(false),30000);
+  window.addEventListener('focus',()=>refresh(false));
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(false)});
+  window.addEventListener('beforeunload',e=>{if(pendingSync||syncing){e.preventDefault();e.returnValue=''}});
+}else{load();render()}
 </script>
 </body>
 </html>
